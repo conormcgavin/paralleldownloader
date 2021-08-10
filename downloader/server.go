@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
 )
@@ -35,7 +36,7 @@ type server struct {
 	Router          *mux.Router
 	nextID          int
 	directory       string
-	lock            *sync.Mutex
+	lock            *sync.Mutex // must change
 	manifestManager manifestManager
 	saver           chan responseSaver
 	exit            chan bool
@@ -83,7 +84,7 @@ func (s *server) Run() {
 }
 
 func (s *server) serverStartupCheck() error {
-	fmt.Println("Checking for incomplete requests.")
+	fmt.Println("Start up commenced. Checking for incomplete requests from last run.")
 	dirInfo, err := ioutil.ReadDir(s.directory)
 	if err != nil {
 		if err = os.Mkdir(s.directory, 0755); err != nil {
@@ -134,18 +135,6 @@ func (s *server) serverStartupCheck() error {
 }
 
 func (s *server) Download(w http.ResponseWriter, r *http.Request) {
-	// receive request.
-	// get directory
-	// make a Request structure (which is literally just the Manifest struct and will work with everything.)
-	// sort out all the information that is actually needed to be store before download starts, (need to pay attention to syncs here)
-	// so only do stuff before starting download that is actually needed!!!
-	// needed:
-	// manifest made with following data:
-	//
-	// start download, respond with json or error depending on what happened
-	// GO do all the things that weren't needed at time to commence download...
-	// how do we wait for these things to finish?
-	//
 	directory := fmt.Sprintf("%s/%d", s.directory, s.nextID)
 	if _, err := os.Stat(directory); !os.IsNotExist(err) {
 		s.respondWithError(w, http.StatusInternalServerError, "Request ID already used.")
@@ -196,8 +185,6 @@ func (s *server) DownloadFile(w http.ResponseWriter, r *http.Request, req Reques
 }
 
 func (s *server) Get(w http.ResponseWriter, r *http.Request) {
-	// no need to make request object
-	// get ID from http.Request
 	id := mux.Vars(r)["id"]
 	req, err := s.GetManifest(id)
 	if err != nil {
@@ -260,20 +247,12 @@ func getFileExtension(fileName string) string { // doesn't work with some links!
 	return strings.Split(fileName, ".")[1]
 }
 
-// server has basically a Logger struct attached to it with a self contained channel
-// send all manifests into this channel whenever we want anything updated.
-// this will asynchronously sort this for us.
-
-// server also has a file writer waiting????
-// after a response is got its sent to a channel with the filename to be stored in, and the response itself.
-// it will write to a file and send into manifest channel a failed or success response! :D
-
 func (s *server) waitForResponse() {
 	fmt.Println("Response Manager: Waiting to save data.")
 	for {
 		select {
 		case rs := <-s.saver:
-			fmt.Println("Writing response to file")
+			fmt.Printf("Writing response to file. Request ID: %d. Original URL: %s", rs.req.ID, rs.req.Orig_data_file_name)
 			s.saveResponse(rs)
 		case <-s.exit:
 			return
@@ -305,3 +284,14 @@ func (s *server) saveResponse(rs responseSaver) {
 	rs.req.Status = "success"
 	s.manifestManager.requestChan <- rs.req
 }
+
+/*
+------------TO-DO-------------
+
+1. Synchronisation (talk to Danis)
+2. Testing
+3. No errors on manifest manager atm
+4.
+
+------------------------------
+*/
