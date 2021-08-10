@@ -10,15 +10,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
-
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
 )
 
-var DIRECTORY_ROOT = "downloader/requests"
-
-type Manifest struct {
+type Request struct {
+	ID                  int    `json:"id"`
 	Url                 string `json:"url"`
 	Orig_data_file_name string `json:"orig_data_file_name"`
 	Status              string `json:"status"`
@@ -27,17 +26,19 @@ type Manifest struct {
 	End_time            int64  `json:"end_time"`
 }
 
-type App struct{}
-
-type Request struct {
-	id      string
-	dirName string
-	body    *RequestBody
+type responseSaver struct {
+	req  Request
+	resp http.Response
 }
 
-type RequestBody struct {
-	Url                 string `json:"url"`
-	Orig_data_file_name string
+type server struct {
+	Router          *mux.Router
+	nextID          int
+	directory       string
+	lock            *sync.Mutex
+	manifestManager manifestManager
+	saver           chan responseSaver
+	exit            chan bool
 }
 
 type Server interface {
@@ -48,77 +49,27 @@ type Server interface {
 	Run()
 }
 
-type server struct {
-	requestChannel chan http.Request
-	terminate      chan bool
-	Router         *mux.Router
-	nextID         int
-	app            App
-}
-
-func newServer() (*server, error) {
+func newServer(directory string) (*server, error) {
 	s := server{
-		requestChannel: make(chan http.Request),
-		terminate:      make(chan bool),
-		Router:         mux.NewRouter(),
-		app:            App{},
+		Router:          mux.NewRouter(),
+		directory:       directory,
+		nextID:          0,
+		lock:            new(sync.Mutex),
+		manifestManager: NewManifestManager(directory),
+		saver:           make(chan responseSaver),
 	}
-	nextID, err := s.serverStartupCheck()
-	if err != nil {
-		return nil, err
+	s.manifestManager.StartRequestListener()
+	go s.waitForResponse()
+
+	if err := s.serverStartupCheck(); err != nil {
+		return nil, fmt.Errorf("error creating server, startup check failed with following error: %s", err.Error())
 	}
-	s.nextID = nextID
+
 	return &s, nil
 }
 
-func NewServer() (*server, error) {
-	return newServer()
-}
-
-func (s *server) serverStartupCheck() (int, error) {
-	fmt.Println("Checking for uncomplete requests.")
-	dirInfo, err := ioutil.ReadDir(DIRECTORY_ROOT)
-	if err != nil {
-		if err = os.Mkdir(DIRECTORY_ROOT, 0755); err != nil {
-			return -1, fmt.Errorf("%s", err.Error())
-		}
-	}
-	lastReq := "0"
-	for _, dir := range dirInfo {
-		if dir.IsDir() {
-			directory := fmt.Sprintf("%s/%s", DIRECTORY_ROOT, dir.Name())
-			m, err := s.app.GetManifest(directory)
-			if err != nil {
-				return -1, err
-			}
-
-			if dir.Name() > lastReq {
-				lastReq = dir.Name()
-			}
-
-			if m.Status == "in progress" || m.Status == "pending" {
-				fmt.Printf("Must redo unfinished download request. ID: %s", dir.Name()) // maybe make an actual http request rather than a fake one
-				/*
-					rb := RequestBody{
-						Url:                 m.Url,
-						Orig_data_file_name: m.Orig_data_file_name,
-					}
-					dirName := fmt.Sprintf("%s/%s", DIRECTORY_ROOT, dir.Name())
-					req := Request{
-						id:      dir.Name(),
-						dirName: dirName,
-						body:    &rb,
-					}
-					if err := s.Download(req); err != nil {
-						s.respondWithError(w, 404, err.Error())
-					}
-					s.respondWithJSON(w, 200, "Download started.")
-				*/
-			}
-		}
-	}
-	nextID, _ := strconv.Atoi(lastReq)
-	return nextID, nil
+func NewServer(directory string) (*server, error) {
+	return newServer(directory)
 }
 
 func (s *server) HandleRequests() {
@@ -131,57 +82,166 @@ func (s *server) Run() {
 	log.Fatal(http.ListenAndServe(":8080", s.Router))
 }
 
-func (s *server) Download(w http.ResponseWriter, r *http.Request) {
-	id := s.nextID + int(time.Now().UnixNano())
-	dirName := fmt.Sprintf("%s/%d", DIRECTORY_ROOT, id)
-	rb, err := s.decodeRequestBody(r)
+func (s *server) serverStartupCheck() error {
+	fmt.Println("Checking for incomplete requests.")
+	dirInfo, err := ioutil.ReadDir(s.directory)
 	if err != nil {
-		s.respondWithError(w, 501, err.Error())
+		if err = os.Mkdir(s.directory, 0755); err != nil {
+			return err
+		}
+	}
+	var redoList []Request
+	lastReq := "0"
+	for _, dir := range dirInfo { // check last time created instead of greatest name?
+		if dir.IsDir() {
+			if dir.Name() > lastReq {
+				lastReq = dir.Name()
+			}
+
+			req, err := s.GetManifest(dir.Name())
+			if err != nil {
+				return err
+			}
+			if req.Status == "in progress" || req.Status == "pending" {
+				fmt.Printf("Must redo unfinished download request. ID: %s\n", dir.Name())
+				redoList = append(redoList, *req)
+			}
+		}
+	}
+
+	for _, req := range redoList {
+		go func(req Request) {
+			resp, err := http.Get(req.Url)
+			if err != nil {
+				req.End_time = time.Now().UnixNano()
+				req.Status = "failed"
+				s.manifestManager.requestChan <- req
+				return
+			}
+			rs := responseSaver{
+				req:  req,
+				resp: *resp,
+			}
+			s.saver <- rs
+		}(req)
+	}
+	nextID, err := strconv.Atoi(lastReq)
+	s.nextID = nextID + 1
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *server) Download(w http.ResponseWriter, r *http.Request) {
+	// receive request.
+	// get directory
+	// make a Request structure (which is literally just the Manifest struct and will work with everything.)
+	// sort out all the information that is actually needed to be store before download starts, (need to pay attention to syncs here)
+	// so only do stuff before starting download that is actually needed!!!
+	// needed:
+	// manifest made with following data:
+	//
+	// start download, respond with json or error depending on what happened
+	// GO do all the things that weren't needed at time to commence download...
+	// how do we wait for these things to finish?
+	//
+	directory := fmt.Sprintf("%s/%d", s.directory, s.nextID)
+	if _, err := os.Stat(directory); !os.IsNotExist(err) {
+		s.respondWithError(w, http.StatusInternalServerError, "Request ID already used.")
+		return
+	}
+	if err := os.Mkdir(directory, 0755); err != nil {
+		s.respondWithError(w, http.StatusInternalServerError, "Error creating request directory.")
 		return
 	}
 
-	req := Request{
-		dirName: dirName,
-		id:      strconv.Itoa(id),
-		body:    rb,
-	}
+	var req Request
+	req.Submission_time = time.Now().UnixNano()
+	req.ID = s.nextID
 	s.nextID += 1
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
+		s.respondWithError(w, http.StatusInternalServerError, err.Error())
+	}
+	defer r.Body.Close()
 
-	if err := s.app.Download(req); err != nil {
-		s.respondWithError(w, 501, err.Error())
+	splitUrl := strings.Split(req.Url, "/")
+	req.Orig_data_file_name = splitUrl[len(splitUrl)-1]
+	req.Start_time = time.Now().UnixNano()
+	req.Status = "pending"
+	s.manifestManager.requestChan <- req
+	s.respondWithJSON(w, http.StatusOK, map[string]string{"status": "Download request received."})
+
+	go s.DownloadFile(w, r, req)
+}
+
+func (s *server) DownloadFile(w http.ResponseWriter, r *http.Request, req Request) { // adding 1 it returns immediately. Adding second updates the manifest, then waits for other to finish downloading before starting.
+	resp, err := http.Get(req.Url)
+	if err != nil {
+		req.End_time = time.Now().UnixNano()
+		req.Status = "failed"
+		s.manifestManager.requestChan <- req
 		return
 	}
-	s.respondWithJSON(w, 200, map[string]int{"request_id": id})
+	req.Status = "in progress"
+	s.manifestManager.requestChan <- req
+
+	rs := responseSaver{
+		req:  req,
+		resp: *resp,
+	}
+	s.saver <- rs
+
 }
 
 func (s *server) Get(w http.ResponseWriter, r *http.Request) {
+	// no need to make request object
+	// get ID from http.Request
 	id := mux.Vars(r)["id"]
-	dirName := fmt.Sprintf("%s/%s", DIRECTORY_ROOT, id)
-	req := Request{
-		dirName: dirName,
-		id:      id,
-	}
-	status, err := s.app.Get(req)
+	req, err := s.GetManifest(id)
 	if err != nil {
-		s.respondWithError(w, 404, err.Error())
-		return
+		switch err.(type) {
+		case *os.PathError:
+			s.respondWithError(w, http.StatusNotFound, "Not found!")
+		case *json.UnmarshalTypeError:
+			s.respondWithError(w, http.StatusInternalServerError, "bad request?")
+		}
 	}
-	s.respondWithJSON(w, 200, map[string]string{"status": *status})
+	s.respondWithJSON(w, http.StatusOK, map[string]string{"status": req.Status})
+}
+
+func (s *server) GetManifest(id string) (*Request, error) {
+	filePath := fmt.Sprintf("%s/%s/manifest.json", s.directory, id)
+	fmt.Printf("Retrieving information from file %s\n", filePath)
+	jsonFile, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer jsonFile.Close()
+	jsonReq, _ := ioutil.ReadAll(jsonFile)
+	var req Request
+	if err := json.Unmarshal(jsonReq, &req); err != nil {
+		return nil, err
+	}
+	return &req, nil
 }
 
 func (s *server) Delete(w http.ResponseWriter, r *http.Request) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
 	id := mux.Vars(r)["id"]
-	dirName := fmt.Sprintf("%s/%s", DIRECTORY_ROOT, id)
-	req := Request{
-		dirName: dirName,
-		id:      id,
-	}
-	err := s.app.Delete(req)
-	if err != nil {
-		s.respondWithError(w, 404, err.Error())
+	directory := fmt.Sprintf("%s/%s", s.directory, id)
+
+	if _, err := os.Stat(directory); os.IsNotExist(err) {
+		s.respondWithError(w, http.StatusNotFound, "Not Found!")
 		return
 	}
-	s.respondWithJSON(w, 200, "successfully deleted.")
+	if err := os.RemoveAll(directory); err != nil {
+		s.respondWithError(w, http.StatusInternalServerError, "error removing directory.")
+		return
+	}
+	s.respondWithJSON(w, http.StatusOK, "Deleted.")
 }
 
 func (s *server) respondWithError(w http.ResponseWriter, code int, message string) {
@@ -196,166 +256,52 @@ func (s *server) respondWithJSON(w http.ResponseWriter, code int, payload interf
 	w.Write(response)
 }
 
-func (s *server) decodeRequestBody(r *http.Request) (*RequestBody, error) {
-	var rb RequestBody
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&rb); err != nil {
-		return nil, err
-	}
-	defer r.Body.Close()
-	return &rb, nil
-}
-
-func (a App) Download(r Request) error {
-	// creates a new folder with name requestID
-	if _, err := os.Stat(r.dirName); !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.Mkdir(r.dirName, 0755); err != nil {
-		return err
-	}
-
-	splitUrl := strings.Split(r.body.Url, "/")
-	r.body.Orig_data_file_name = splitUrl[len(splitUrl)-1]
-	m := Manifest{
-		Url:                 r.body.Url,
-		Orig_data_file_name: r.body.Orig_data_file_name,
-		Status:              "pending",
-		Submission_time:     time.Now().UnixNano(),
-		Start_time:          0,
-		End_time:            0,
-	}
-	if err := a.UpdateManifest(&m, r.dirName); err != nil {
-		return err
-	}
-
-	go a.DownloadFile(r.dirName, &m)
-
-	m.Start_time = time.Now().UnixNano()
-	m.Status = "in progress"
-	if err := a.UpdateManifest(&m, r.dirName); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (a App) DownloadFile(directory string, mf *Manifest) error {
-	fileExt := getFileExtension(mf.Orig_data_file_name)
-	filePath := fmt.Sprintf("%s/data.%s", directory, fileExt)
-	// Get the data
-	mf.Start_time = time.Now().UnixNano()
-
-	resp, err := http.Get(mf.Url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	mf.Status = "complete"
-	mf.End_time = time.Now().UnixNano()
-
-	a.UpdateManifest(mf, directory)
-
-	out, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, resp.Body)
-	return err
-}
-
-func (a App) Get(r Request) (*string, error) {
-	m, err := a.GetManifest(r.dirName)
-	if err != nil {
-		return nil, err
-	}
-	status := m.Status
-	return &status, nil
-}
-
-func (a App) Delete(r Request) error {
-	if _, err := os.Stat(r.dirName); os.IsNotExist(err) {
-		return err
-	}
-	if err := os.RemoveAll(r.dirName); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (a App) UpdateManifest(m *Manifest, directory string) error {
-	mfPath := fmt.Sprintf("%s/manifest.json", directory)
-	jsonMf, err := json.MarshalIndent(m, "", "	")
-	if err != nil {
-		return fmt.Errorf("%s", err.Error())
-	}
-	bs := []byte(jsonMf)
-	ioutil.WriteFile(mfPath, bs, 0755)
-	return nil
-}
-
-func (a App) GetManifest(directory string) (*Manifest, error) {
-	mfPath := fmt.Sprintf("%s/manifest.json", directory)
-	jsonFile, err := os.Open(mfPath)
-	if err != nil {
-		return nil, err
-	}
-	defer jsonFile.Close()
-	mf, _ := ioutil.ReadAll(jsonFile)
-	var m Manifest
-	if err := json.Unmarshal(mf, &m); err != nil {
-		return nil, err
-	}
-	return &m, nil
-}
-
-func getFileExtension(fileName string) string {
+func getFileExtension(fileName string) string { // doesn't work with some links!
 	return strings.Split(fileName, ".")[1]
 }
 
-// ------------- TO-DO ----------------- \\
+// server has basically a Logger struct attached to it with a self contained channel
+// send all manifests into this channel whenever we want anything updated.
+// this will asynchronously sort this for us.
 
-// fix errors (error struct? use http response format?) switch statement errors?			respondWithJSON(w, http.StatusOK, p)
-// write tests and make sure all working
-// get concurrency working properly
+// server also has a file writer waiting????
+// after a response is got its sent to a channel with the filename to be stored in, and the response itself.
+// it will write to a file and send into manifest channel a failed or success response! :D
 
-// ------------- TO-DO ----------------- \\
-
-/*
-
-func TestUpdateProduct(t *testing.T) {
-
-    clearTable()
-    addProducts(1)
-
-    req, _ := http.NewRequest("GET", "/product/1", nil)
-    response := executeRequest(req)
-    var originalProduct map[string]interface{}
-    json.Unmarshal(response.Body.Bytes(), &originalProduct)
-
-    var jsonStr = []byte(`{"name":"test product - updated name", "price": 11.22}`)
-    req, _ = http.NewRequest("PUT", "/product/1", bytes.NewBuffer(jsonStr))
-    req.Header.Set("Content-Type", "application/json")
-
-    response = executeRequest(req)
-
-    checkResponseCode(t, http.StatusOK, response.Code)
-
-    var m map[string]interface{}
-    json.Unmarshal(response.Body.Bytes(), &m)
-
-    if m["id"] != originalProduct["id"] {
-        t.Errorf("Expected the id to remain the same (%v). Got %v", originalProduct["id"], m["id"])
-    }
-
-    if m["name"] == originalProduct["name"] {
-        t.Errorf("Expected the name to change from '%v' to '%v'. Got '%v'", originalProduct["name"], m["name"], m["name"])
-    }
-
-    if m["price"] == originalProduct["price"] {
-        t.Errorf("Expected the price to change from '%v' to '%v'. Got '%v'", originalProduct["price"], m["price"], m["price"])
-    }
+func (s *server) waitForResponse() {
+	fmt.Println("Response Manager: Waiting to save data.")
+	for {
+		select {
+		case rs := <-s.saver:
+			fmt.Println("Writing response to file")
+			s.saveResponse(rs)
+		case <-s.exit:
+			return
+		}
+	}
 }
 
-*/
+func (s *server) saveResponse(rs responseSaver) {
+	defer rs.resp.Body.Close()
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	filePath := fmt.Sprintf("%s/%d/data.%s", s.directory, rs.req.ID, getFileExtension(rs.req.Orig_data_file_name))
+	out, err := os.Create(filePath)
+	if err != nil {
+		rs.req.End_time = time.Now().UnixNano()
+		rs.req.Status = "failed"
+		s.manifestManager.requestChan <- rs.req
+		return
+	}
+	defer out.Close()
+	if _, err = io.Copy(out, rs.resp.Body); err != nil {
+		rs.req.End_time = time.Now().UnixNano()
+		rs.req.Status = "failed"
+		s.manifestManager.requestChan <- rs.req
+		return
+	}
+
+	rs.req.End_time = time.Now().UnixNano()
+	rs.req.Status = "success"
+	s.manifestManager.requestChan <- rs.req
+}
