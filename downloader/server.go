@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -138,6 +139,7 @@ func (s *server) Download(w http.ResponseWriter, r *http.Request) {
 	directory := fmt.Sprintf("%s/%d", s.directory, s.nextID)
 	if _, err := os.Stat(directory); !os.IsNotExist(err) {
 		s.respondWithError(w, http.StatusInternalServerError, "Request ID already used.")
+		s.nextID += 1
 		return
 	}
 	if err := os.Mkdir(directory, 0755); err != nil {
@@ -190,10 +192,15 @@ func (s *server) Get(w http.ResponseWriter, r *http.Request) {
 	req, err := s.getManifest(id)
 	if err != nil {
 		switch err.(type) {
-		case *os.PathError:
+		case *fs.PathError:
 			s.respondWithError(w, http.StatusNotFound, "Not found!")
+			return
 		case *json.UnmarshalTypeError:
 			s.respondWithError(w, http.StatusInternalServerError, "bad request?")
+			return
+		default:
+			s.respondWithError(w, http.StatusInternalServerError, "unable to process request")
+			return
 		}
 	}
 	s.respondWithJSON(w, http.StatusOK, map[string]string{"status": req.Status})
@@ -253,7 +260,7 @@ func (s *server) waitForResponse() {
 	for {
 		select {
 		case rs := <-s.saver:
-			fmt.Printf("Writing response to file. Request ID: %d. Original URL: %s", rs.req.ID, rs.req.Orig_data_file_name)
+			fmt.Printf("Writing response to file. Request ID: %d. Original URL: %s\n", rs.req.ID, rs.req.Orig_data_file_name)
 			s.saveResponse(rs)
 		case <-s.exit:
 			return
