@@ -56,7 +56,7 @@ func newServer(directory string) (*server, error) {
 		directory:       directory,
 		nextID:          0,
 		lock:            new(sync.Mutex),
-		manifestManager: NewManifestManager(directory),
+		manifestManager: *NewManifestManager(directory),
 		saver:           make(chan responseSaver),
 	}
 	s.manifestManager.StartRequestListener()
@@ -99,7 +99,7 @@ func (s *server) serverStartupCheck() error {
 				lastReq = dir.Name()
 			}
 
-			req, err := s.GetManifest(dir.Name())
+			req, err := s.getManifest(dir.Name())
 			if err != nil {
 				return err
 			}
@@ -152,6 +152,7 @@ func (s *server) Download(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&req); err != nil {
 		s.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	defer r.Body.Close()
 
@@ -162,10 +163,10 @@ func (s *server) Download(w http.ResponseWriter, r *http.Request) {
 	s.manifestManager.requestChan <- req
 	s.respondWithJSON(w, http.StatusOK, map[string]string{"status": "Download request received."})
 
-	go s.DownloadFile(w, r, req)
+	go s.downloadFile(w, r, req)
 }
 
-func (s *server) DownloadFile(w http.ResponseWriter, r *http.Request, req Request) { // adding 1 it returns immediately. Adding second updates the manifest, then waits for other to finish downloading before starting.
+func (s *server) downloadFile(w http.ResponseWriter, r *http.Request, req Request) { // adding 1 it returns immediately. Adding second updates the manifest, then waits for other to finish downloading before starting.
 	resp, err := http.Get(req.Url)
 	if err != nil {
 		req.End_time = time.Now().UnixNano()
@@ -186,7 +187,7 @@ func (s *server) DownloadFile(w http.ResponseWriter, r *http.Request, req Reques
 
 func (s *server) Get(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
-	req, err := s.GetManifest(id)
+	req, err := s.getManifest(id)
 	if err != nil {
 		switch err.(type) {
 		case *os.PathError:
@@ -198,10 +199,10 @@ func (s *server) Get(w http.ResponseWriter, r *http.Request) {
 	s.respondWithJSON(w, http.StatusOK, map[string]string{"status": req.Status})
 }
 
-func (s *server) GetManifest(id string) (*Request, error) {
-	filePath := fmt.Sprintf("%s/%s/manifest.json", s.directory, id)
-	fmt.Printf("Retrieving information from file %s\n", filePath)
-	jsonFile, err := os.Open(filePath)
+func (s *server) getManifest(id string) (*Request, error) {
+	manifestPath := fmt.Sprintf("%s/%s/manifest.json", s.directory, id)
+	fmt.Printf("Retrieving information from file %s\n", manifestPath)
+	jsonFile, err := os.Open(manifestPath)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +226,7 @@ func (s *server) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := os.RemoveAll(directory); err != nil {
-		s.respondWithError(w, http.StatusInternalServerError, "error removing directory.")
+		s.respondWithError(w, http.StatusInternalServerError, "error removing request directory.")
 		return
 	}
 	s.respondWithJSON(w, http.StatusOK, "Deleted.")
@@ -243,7 +244,7 @@ func (s *server) respondWithJSON(w http.ResponseWriter, code int, payload interf
 	w.Write(response)
 }
 
-func getFileExtension(fileName string) string { // doesn't work with some links!
+func getFileExtension(fileName string) string { // doesn't work with some links! some links dont have a .ext at the end
 	return strings.Split(fileName, ".")[1]
 }
 
@@ -290,8 +291,7 @@ func (s *server) saveResponse(rs responseSaver) {
 
 1. Synchronisation (talk to Danis)
 2. Testing
-3. No errors on manifest manager atm
-4.
+3. No error checking on manifest manager atm
 
 ------------------------------
 */

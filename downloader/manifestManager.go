@@ -9,6 +9,10 @@ import (
 	_ "github.com/lib/pq"
 )
 
+type ManifestManager interface {
+	StartRequestListener()
+}
+
 type manifestManager struct {
 	requestChan chan Request
 	exitChan    chan bool
@@ -16,8 +20,8 @@ type manifestManager struct {
 	lock        *sync.Mutex
 }
 
-func NewManifestManager(directory string) manifestManager {
-	return manifestManager{
+func newManifestManager(directory string) *manifestManager {
+	return &manifestManager{
 		requestChan: make(chan Request),
 		exitChan:    make(chan bool),
 		directory:   directory,
@@ -25,11 +29,15 @@ func NewManifestManager(directory string) manifestManager {
 	}
 }
 
-func (mm manifestManager) StartRequestListener() {
+func NewManifestManager(directory string) *manifestManager {
+	return newManifestManager(directory)
+}
+
+func (mm *manifestManager) StartRequestListener() {
 	go mm.waitForRequest(mm.directory)
 }
 
-func (mm manifestManager) waitForRequest(directory string) {
+func (mm *manifestManager) waitForRequest(directory string) {
 	fmt.Println("Manifest Manager: Listening for updates.")
 	for {
 		select {
@@ -42,7 +50,7 @@ func (mm manifestManager) waitForRequest(directory string) {
 	}
 }
 
-func (mm manifestManager) UpdateManifest(req Request, directory string) { // shoudl be lower case
+func (mm *manifestManager) UpdateManifest(req Request, directory string) { // shoudl be lower case
 	mm.lock.Lock()
 	mfPath := fmt.Sprintf("%s/%d/manifest.json", directory, req.ID)
 	jsonMf, _ := json.MarshalIndent(req, "", "	")
